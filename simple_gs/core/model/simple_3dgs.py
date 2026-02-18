@@ -1,7 +1,5 @@
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
-import math
-
 import torch
 import torch.nn as nn
 from gsplat import rasterization
@@ -12,10 +10,13 @@ class Simple3DGS(nn.Module):
         """
         Args:
             model_cfg: OmegaConf config with NUM_INIT_POINTS, SH_DEGREE, etc.
-            data_info: dict with keys "fov" (radians), "bg_color" (float in [0,1]).
+            data_info: dict with keys "fl_x", "fl_y", "cx", "cy", "bg_color".
         """
         super().__init__()
-        self.fov_x = data_info["fov"]
+        self.fl_x = data_info["fl_x"]
+        self.fl_y = data_info["fl_y"]
+        self.cx = data_info["cx"]
+        self.cy = data_info["cy"]
         self.bg_color = data_info["bg_color"]
         self.sh_degree_max = model_cfg.SH_DEGREE
         self.sh_degree = 0  # will be increased during training
@@ -24,7 +25,7 @@ class Simple3DGS(nn.Module):
         num_sh_bases = (self.sh_degree_max + 1) ** 2
 
         # Random initialization
-        means = (torch.rand(num_points, 3) - 0.5) * 6.0  # uniform in [-3, 3]
+        means = (torch.rand(num_points, 3) - 0.5) * 10.0  # uniform in [-3, 3]
         quats = torch.zeros(num_points, 4)
         quats[:, 0] = 1.0  # identity rotation
         scales = torch.log(torch.full((num_points, 3), 0.005))  # small initial size
@@ -74,12 +75,11 @@ class Simple3DGS(nn.Module):
         viewmat[2, :] *= -1  # flip Z
         viewmat = viewmat[None]  # (1, 4, 4)
 
-        # Build intrinsics from horizontal FOV (assume square pixels)
-        focal = 0.5 * img_w / math.tan(0.5 * self.fov_x)
+        # Build intrinsics from calibrated parameters
         K = torch.tensor(
             [
-                [focal, 0.0, img_w / 2.0],
-                [0.0, focal, img_h / 2.0],
+                [self.fl_x, 0.0, self.cx],
+                [0.0, self.fl_y, self.cy],
                 [0.0, 0.0, 1.0],
             ],
             dtype=torch.float32,

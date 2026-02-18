@@ -1,6 +1,6 @@
 DATASET:
-  NAME: 'Lego'
-  DATA_PATH: '/root/workspace/simple_gs/example_data/lego'
+  NAME: 'Cupcake'
+  DATA_PATH: '/root/workspace/example_data/development/Cupcake'
   BACKGROUND_COLOR: 255.0
 
 MODEL:
@@ -8,7 +8,7 @@ MODEL:
   # Gaussian initialization
   NUM_INIT_POINTS: 100000
   SH_DEGREE: 3
-  SCENE_SCALE: 1.0
+  SCENE_SCALE: 2.0
   # Training
   TRAIN_TOTAL_STEP: 30000
   VAL_INTERVAL_STEP: 5000

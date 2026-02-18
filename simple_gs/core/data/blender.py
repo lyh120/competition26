@@ -1,7 +1,6 @@
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
 import json
-import math
 import os
 import random
 
@@ -10,17 +9,26 @@ import torchvision
 
 
 class Blender(torch.utils.data.Dataset):
-    def __init__(self, data_cfg, split, slice_data=None):
+    def __init__(self, data_cfg, split, load_images=True):
         super().__init__()
         # build path
         assert split in ["train", "val", "test"]
         self._bg_color = data_cfg.BACKGROUND_COLOR / 255.0
+        self._load_images = load_images
         # load data
         self._split = split
         self._img_path_base = os.path.join(data_cfg.DATA_PATH, split)
-        self._meta_path_base = os.path.join(data_cfg.DATA_PATH, f"transforms_{split}.json")
-        self._records, self._data_info = self._load_data()
-        self._pre_loading_data()
+        if split == "val":
+            self._split = "test"
+            self._meta_path_base = os.path.join(data_cfg.DATA_PATH, "transforms_test.json")
+            self._records, self._data_info = self._load_data()
+            # keep first 4 records
+            self._records = {k: v for k, v in self._records.items() if k in list(self._records.keys())[:4]}
+        else:
+            self._meta_path_base = os.path.join(data_cfg.DATA_PATH, f"transforms_{split}.json")
+            self._records, self._data_info = self._load_data()
+        if load_images:
+            self._pre_loading_data()
         self._records_keys = list(self._records.keys())
 
     def __getitem__(self, index):
@@ -31,34 +39,34 @@ class Blender(torch.utils.data.Dataset):
         return self._length
 
     def _load_one_record(self, record):
-        if record["img_tensor"] is not None:
-            image_tensor = record["img_tensor"]
-            alpha_tensor = record["alpha_tensor"]
-        else:
-            image_tensor = load_img(record["file_path"], channel=4).float() / 255.0
-            image_tensor, alpha_tensor = image_tensor[:3], image_tensor[-1:]
-            image_tensor = image_tensor * alpha_tensor + (1.0 - alpha_tensor) * self._bg_color
-        transform_matrix = record["transform_matrix"]
         one_record_data = {
-            "images": image_tensor,
-            "transforms": transform_matrix,
-            "alphas": alpha_tensor,
+            "transforms": record["transform_matrix"],
             "infos": {"frame_name": record["frame_name"]},
         }
+        if self._load_images:
+            if record["img_tensor"] is not None:
+                image_tensor = record["img_tensor"]
+            else:
+                image_tensor = load_img(record["file_path"], channel=3).float() / 255.0
+            one_record_data["images"] = image_tensor
         return one_record_data
 
     def _load_data(self):
         with open(self._meta_path_base, "rb") as f:
             json_data = json.load(f)
         meta_info = {
-            "fov": json_data["camera_angle_x"],
-            "fov_degree": math.degrees(json_data["camera_angle_x"]),
             "bg_color": self._bg_color,
+            "img_h": int(json_data["h"]),
+            "img_w": int(json_data["w"]),
+            "fl_x": json_data["fl_x"],
+            "fl_y": json_data["fl_y"],
+            "cx": json_data["cx"],
+            "cy": json_data["cy"],
         }
         records = {}
         for frame in json_data["frames"]:
             frame_name = "_".join(frame["file_path"].split("/")[-2:])
-            file_path = os.path.join(self._img_path_base, frame["file_path"].split("/")[-1] + ".png")
+            file_path = os.path.join(self._img_path_base, frame["file_path"].split("/")[-1])
             transform_matrix = torch.tensor(frame["transform_matrix"]).float()[:3]
             records[frame_name] = {
                 "frame_name": frame_name,
@@ -66,7 +74,6 @@ class Blender(torch.utils.data.Dataset):
                 "img_tensor": None,
                 "alpha_tensor": None,
                 "transform_matrix": transform_matrix,
-                "rotation": frame["rotation"],
             }
         return records, meta_info
 
@@ -75,18 +82,16 @@ class Blender(torch.utils.data.Dataset):
         from concurrent.futures import ThreadPoolExecutor
 
         def _load_img(key, record):
-            image_tensor = load_img(record["file_path"], channel=4).float() / 255.0
-            image_tensor, alpha_tensor = image_tensor[:3], image_tensor[-1:]
-            image_tensor = image_tensor * alpha_tensor + (1.0 - alpha_tensor) * self._bg_color
-            return (key, image_tensor, alpha_tensor)
+            image_tensor = load_img(record["file_path"], channel=3).float() / 255.0
+            image_tensor = image_tensor[:3]
+            return (key, image_tensor)
 
         # for key, record in records.items():
         print(f"Load data [{self._split}]: [{len(self._records.items())}].")
         with ThreadPoolExecutor(max_workers=min(multiprocessing.cpu_count(), 16)) as executor:
             all_images = list(executor.map(lambda _rec: _load_img(_rec[0], _rec[1]), self._records.items()))
-        for key, image, alpha in all_images:
+        for key, image in all_images:
             self._records[key]["img_tensor"] = image
-            self._records[key]["alpha_tensor"] = alpha
 
 
 def load_img(file_name, channel=3):

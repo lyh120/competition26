@@ -2,7 +2,6 @@
 # Copyright (c) Xuangeng Chu (xg.chu@outlook.com)
 
 import argparse
-import json
 import math
 import os
 import random
@@ -11,12 +10,16 @@ import warnings
 import gsplat
 import torch
 import yaml
-from torchvision.utils import save_image
-from tqdm import tqdm
-
 from core.data import Blender
 from core.libs import ConfigDict, ssim
 from core.model import Simple3DGS
+from torchvision.utils import make_grid, save_image
+from tqdm import tqdm
+
+
+def gamma_augment(image, gamma=0.5):
+    enhanced = torch.clamp(image, 0, 1).pow(gamma)
+    return enhanced
 
 
 def train(config_path, device="cuda"):
@@ -28,12 +31,13 @@ def train(config_path, device="cuda"):
     # build output directory
     output_dir = os.path.join("outputs", meta_cfg.EXP_STR, meta_cfg.TIME_STR)
     os.makedirs(os.path.join(output_dir, "examples"), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "test"), exist_ok=True)
     with open(os.path.join(output_dir, "config.yaml"), "w") as f:
         yaml.dump(dict(meta_cfg), f, default_flow_style=False)
 
     # load dataset
     train_dataset = Blender(meta_cfg.DATASET, split="train")
-    val_dataset = Blender(meta_cfg.DATASET, split="val")
+    val_dataset = Blender(meta_cfg.DATASET, split="val", load_images=False)
     num_train = len(train_dataset._records_keys)
 
     # build model
@@ -74,6 +78,7 @@ def train(config_path, device="cuda"):
     strategy_state = strategy.initialize_state(scene_scale=cfg.SCENE_SCALE)
 
     # training loop
+    train_aug_images = []
     pbar = tqdm(range(total_steps))
     for step in pbar:
         # gradually increase SH degree
@@ -82,7 +87,7 @@ def train(config_path, device="cuda"):
 
         # sample random training image
         data = train_dataset[random.randint(0, num_train - 1)]
-        gt_image = data["images"].to(device)  # (3, H, W)
+        gt_image = gamma_augment(data["images"].to(device))  # (3, H, W)
         camtoworld = data["transforms"].to(device)  # (3, 4)
         H, W = gt_image.shape[1], gt_image.shape[2]
 
@@ -114,73 +119,65 @@ def train(config_path, device="cuda"):
                 psnr = -10.0 * math.log10(mse.clamp_min(1e-10).item())
             pbar.set_postfix(loss=f"{loss.item():.4f}", psnr=f"{psnr:.2f}", n_gs=model.num_gaussians)
 
+        # collect augmented train images for visualization (only once)
+        if train_aug_images is not None:
+            train_aug_images.append(gt_image.clamp(0, 1))
+            if len(train_aug_images) >= 4:
+                grid = make_grid(train_aug_images[:4], nrow=2)
+                save_image(grid, os.path.join(output_dir, "examples", "train_aug.jpg"))
+                train_aug_images = None
+
         # validation
         if step > 0 and step % cfg.VAL_INTERVAL_STEP == 0:
             validate(model, val_dataset, step, device, output_dir)
+            torch.save(model.splats.state_dict(), os.path.join(output_dir, "latest.pt"))
+            print(f"Model saved to {output_dir}/latest.pt")
 
     # save model checkpoint
-    torch.save(model.splats.state_dict(), os.path.join(output_dir, "model.pt"))
-    print(f"Model saved to {output_dir}/model.pt")
+    torch.save(model.splats.state_dict(), os.path.join(output_dir, "latest.pt"))
+    print(f"Model saved to {output_dir}/latest.pt")
 
     # run test evaluation
-    test_dataset = Blender(meta_cfg.DATASET, split="test")
+    test_dataset = Blender(meta_cfg.DATASET, split="test", load_images=False)
     evaluate(model, test_dataset, device, output_dir)
 
 
 @torch.no_grad()
 def validate(model, val_dataset, step, device, output_dir):
     model.eval()
-    psnr_sum = 0.0
+    H, W = val_dataset._data_info["img_h"], val_dataset._data_info["img_w"]
     num_val = len(val_dataset._records_keys)
+    val_images = []
     for i in range(num_val):
         data = val_dataset[i]
-        gt_image = data["images"].to(device)
         camtoworld = data["transforms"].to(device)
-        H, W = gt_image.shape[1], gt_image.shape[2]
         rendered, _, _ = model(camtoworld, H, W)
-        gt_hwc = gt_image.permute(1, 2, 0)
-        mse = ((rendered - gt_hwc) ** 2).mean()
-        psnr_sum += -10.0 * math.log10(mse.clamp_min(1e-10).item())
-        # save first 5 rendered images for visual spot-checking
-        if i < 5:
-            name = val_dataset._records_keys[i]
-            save_image(
-                rendered.permute(2, 0, 1).clamp(0, 1),
-                os.path.join(output_dir, "examples", f"val_step{step}_{name}.png"),
-            )
-    avg_psnr = psnr_sum / num_val
-    print(f"\n[Step {step}] Val PSNR: {avg_psnr:.2f} dB | {model.num_gaussians} Gaussians")
+        # collect first 4 rendered images for visual spot-checking
+        if i < 4:
+            val_images.append(rendered.permute(2, 0, 1).clamp(0, 1))
+    # save 4 views as a 2x2 grid
+    if val_images:
+        grid = make_grid(val_images, nrow=2)
+        save_image(grid, os.path.join(output_dir, "examples", f"val_step{step}.jpg"))
+    print(f"\n[Step {step}] {model.num_gaussians} Gaussians")
     model.train()
 
 
 @torch.no_grad()
 def evaluate(model, test_dataset, device, output_dir):
     model.eval()
+    H, W = test_dataset._data_info["img_h"], test_dataset._data_info["img_w"]
     num_test = len(test_dataset._records_keys)
-    per_image_metrics = []
     for i in range(num_test):
         data = test_dataset[i]
-        gt_image = data["images"].to(device)
         camtoworld = data["transforms"].to(device)
-        H, W = gt_image.shape[1], gt_image.shape[2]
         rendered, _, _ = model(camtoworld, H, W)
-        gt_hwc = gt_image.permute(1, 2, 0)
-        mse = ((rendered - gt_hwc) ** 2).mean()
-        psnr_val = -10.0 * math.log10(mse.clamp_min(1e-10).item())
-        ssim_val = ssim(rendered, gt_hwc).item()
         frame_name = test_dataset._records_keys[i]
-        per_image_metrics.append({"name": frame_name, "psnr": psnr_val, "ssim": ssim_val})
         save_image(
             rendered.permute(2, 0, 1).clamp(0, 1),
-            os.path.join(output_dir, "examples", f"{frame_name}.png"),
+            os.path.join(output_dir, "test", f"{frame_name}.png"),
         )
-    avg_psnr = sum(m["psnr"] for m in per_image_metrics) / num_test
-    avg_ssim = sum(m["ssim"] for m in per_image_metrics) / num_test
-    metrics = {"avg_psnr": avg_psnr, "avg_ssim": avg_ssim, "per_image": per_image_metrics}
-    with open(os.path.join(output_dir, "metrics.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"Test PSNR: {avg_psnr:.2f} dB | Test SSIM: {avg_ssim:.4f}")
-    print(f"Results saved to {output_dir}/")
+    print(f"Test renders saved to {output_dir}/test/")
     model.train()
 
 

@@ -1,0 +1,32 @@
+DATASET:
+  NAME: 'GearWorks'
+  DATA_PATH: '/root/workspace/example_data/development/GearWorks'
+  BACKGROUND_COLOR: 255.0
+
+MODEL:
+  NAME: 'Simple3DGS'
+  # Gaussian initialization
+  NUM_INIT_POINTS: 100000
+  SH_DEGREE: 3
+  SCENE_SCALE: 2.0
+  # Training
+  TRAIN_TOTAL_STEP: 30000
+  VAL_INTERVAL_STEP: 5000
+  LOG_INTERVAL_STEP: 100
+  SH_UPGRADE_INTERVAL: 1000
+  # Per-parameter learning rates
+  LR_MEANS: 1.6e-4
+  LR_MEANS_FINAL: 1.6e-6
+  LR_QUATS: 1.0e-3
+  LR_SCALES: 5.0e-3
+  LR_OPACITIES: 5.0e-2
+  LR_SH0: 2.5e-3
+  LR_SHN: 1.25e-4
+  # Densification (gsplat DefaultStrategy)
+  DENSIFY_START_STEP: 500
+  DENSIFY_STOP_STEP: 15000
+  DENSIFY_INTERVAL: 100
+  DENSIFY_GRAD_THRESH: 0.0002
+  OPACITY_RESET_INTERVAL: 3000
+  # Loss
+  LAMBDA_SSIM: 0.2
