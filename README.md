@@ -11,10 +11,17 @@ A minimal 3DGS implementation built on [gsplat](https://github.com/nerfstudio-pr
 - tqdm
 - PyYAML
 
+## Installation
+
+```
+conda env create -f environment.yml
+conda activate gsplat
+```
+
 ## Project Structure
 
 ```
-simple_gs/
+3DRR_codebase/
 ├── config/             # Training configs (YAML)
 ├── core/
 │   ├── data/           # Dataset loaders (Blender format)
