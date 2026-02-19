@@ -1,0 +1,32 @@
+name: gsplat
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+
+  # Core (repo needs these)
+  - pytorch
+  - torchvision
+  - pyyaml
+  - omegaconf
+  - tqdm
+
+  # Practical deps (gsplat build / runtime)
+  - numpy
+  - ninja
+  - jaxtyping
+  - rich
+  - packaging
+  - setuptools
+  - wheel
+
+  # GPU (adjust to your machine)
+  - pytorch-cuda=11.8
+  - cuda-nvcc=11.8
+
+  # Install gsplat via pip (will JIT/build CUDA extensions depending on your setup)
+  - pip:
+      - gsplat
