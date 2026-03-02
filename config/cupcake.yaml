@@ -1,18 +1,21 @@
 DATASET:
   NAME: 'Cupcake'
-  DATA_PATH: '/data/development/Cupcake'
+  # Development data in this branch has train/ + test/ (no val/ folder).
+  DATA_PATH: 'core/data/lowlight_development/development/Cupcake'
   BACKGROUND_COLOR: 255.0
 
 MODEL:
   NAME: 'Simple3DGS'
   # Gaussian initialization
-  NUM_INIT_POINTS: 100000
+  NUM_INIT_POINTS: 20000
   SH_DEGREE: 3
   SCENE_SCALE: 2.0
   # Training
-  TRAIN_TOTAL_STEP: 30000
-  VAL_INTERVAL_STEP: 5000
-  LOG_INTERVAL_STEP: 100
+  # First minimal smoke run.
+  TRAIN_TOTAL_STEP: 300
+  # Skip validate() because development scenes do not include val images.
+  VAL_INTERVAL_STEP: 100000
+  LOG_INTERVAL_STEP: 20
   SH_UPGRADE_INTERVAL: 1000
   # Per-parameter learning rates
   LR_MEANS: 1.6e-4
@@ -23,8 +26,8 @@ MODEL:
   LR_SH0: 2.5e-3
   LR_SHN: 1.25e-4
   # Densification (gsplat DefaultStrategy)
-  DENSIFY_START_STEP: 500
-  DENSIFY_STOP_STEP: 15000
+  DENSIFY_START_STEP: 100
+  DENSIFY_STOP_STEP: 300
   DENSIFY_INTERVAL: 100
   DENSIFY_GRAD_THRESH: 0.0002
   OPACITY_RESET_INTERVAL: 3000
