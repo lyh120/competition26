@@ -2,8 +2,6 @@
 
 import json
 import os
-import random
-
 import torch
 import torchvision
 
@@ -30,6 +28,7 @@ class Blender(torch.utils.data.Dataset):
         if load_images:
             self._pre_loading_data()
         self._records_keys = list(self._records.keys())
+        self._length = len(self._records_keys)
 
     def __getitem__(self, index):
         frame_key = self._records_keys[index % len(self._records_keys)]
@@ -41,6 +40,7 @@ class Blender(torch.utils.data.Dataset):
     def _load_one_record(self, record):
         one_record_data = {
             "transforms": record["transform_matrix"],
+            "image_id": torch.tensor(record["image_id"], dtype=torch.long),
             "infos": {"frame_name": record["frame_name"]},
         }
         if self._load_images:
@@ -75,6 +75,9 @@ class Blender(torch.utils.data.Dataset):
                 "alpha_tensor": None,
                 "transform_matrix": transform_matrix,
             }
+        for idx, key in enumerate(records.keys()):
+            records[key]["image_id"] = idx
+        meta_info["num_images"] = len(records)
         return records, meta_info
 
     def _pre_loading_data(self):

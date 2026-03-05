@@ -22,6 +22,12 @@ MODEL:
   LR_OPACITIES: 5.0e-2
   LR_SH0: 2.5e-3
   LR_SHN: 1.25e-4
+  # Appearance branch (NeRF-W style exposure head)
+  USE_APPEARANCE: True
+  APPEARANCE_DIM: 32
+  APPEARANCE_HIDDEN_DIM: 128
+  LR_APPEARANCE: 2.5e-3
+  TRAIN_TARGET_GAMMA: 1.0
   # Densification (gsplat DefaultStrategy)
   DENSIFY_START_STEP: 500
   DENSIFY_STOP_STEP: 15000

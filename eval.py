@@ -32,10 +32,14 @@ def evaluate(checkpoint_path, device="cuda"):
     H, W = test_dataset._data_info["img_h"], test_dataset._data_info["img_w"]
 
     # build model and load checkpoint
-    model = Simple3DGS(cfg, test_dataset._data_info).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    for k, v in ckpt.items():
-        model.splats[k] = torch.nn.Parameter(v)
+    data_info = dict(test_dataset._data_info)
+    if "appearance_embeddings.weight" in ckpt:
+        data_info["num_train_images"] = ckpt["appearance_embeddings.weight"].shape[0]
+    else:
+        data_info["num_train_images"] = test_dataset._data_info["num_images"]
+    model = Simple3DGS(cfg, data_info).to(device)
+    model.load_state_dict(ckpt, strict=False)
     model.sh_degree = model.sh_degree_max
     model.eval()
 
@@ -46,7 +50,7 @@ def evaluate(checkpoint_path, device="cuda"):
     for i in tqdm(range(num_test), desc="Rendering"):
         data = test_dataset[i]
         camtoworld = data["transforms"].to(device)
-        rendered, _, _ = model(camtoworld, H, W)
+        rendered, _, _ = model(camtoworld, H, W, canonical=True)
         frame_name = test_dataset._records_keys[i]
         save_image(
             rendered.permute(2, 0, 1).clamp(0, 1),
