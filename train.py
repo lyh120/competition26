@@ -18,16 +18,36 @@ from core.libs import ConfigDict, ssim
 from core.model import Simple3DGS
 
 
-# ====================== LOW-LIGHT ENHANCEMENT (GAMMA AUGMENT) ===================
-# This helper applies a gamma correction (gamma < 1 brightens dark regions),
-# used as a simple *low-light enhancement* during training.
-# ================================================================================
+def prepare_train_target(image, model_cfg):
+    """Prepare supervision target image for training.
 
-def gamma_augment(image, gamma=0.5):
-    enhanced = torch.clamp(image, 0, 1).pow(gamma)
-    return enhanced
+    By default we supervise with raw low-light observations (clamped to [0, 1]).
+    Optional gamma correction can be enabled via TRAIN_TARGET_GAMMA (>0).
+    """
+    gamma = float(getattr(model_cfg, "TRAIN_TARGET_GAMMA", 1.0))
+    image = torch.clamp(image, 0, 1)
+    if abs(gamma - 1.0) < 1e-8:
+        return image
+    return image.pow(gamma)
 
-# --------------------------------------------------------------------------------
+
+def validate_model_cfg(model_cfg):
+    """Run lightweight config validation to fail fast on invalid settings."""
+    train_gamma = float(getattr(model_cfg, "TRAIN_TARGET_GAMMA", 1.0))
+    if train_gamma <= 0:
+        raise ValueError(f"TRAIN_TARGET_GAMMA must be > 0, got {train_gamma}.")
+
+    if bool(getattr(model_cfg, "USE_APPEARANCE", True)):
+        appearance_dim = int(getattr(model_cfg, "APPEARANCE_DIM", 32))
+        hidden_dim = int(getattr(model_cfg, "APPEARANCE_HIDDEN_DIM", 128))
+        appearance_lr = float(getattr(model_cfg, "LR_APPEARANCE", model_cfg.LR_SH0))
+        if appearance_dim <= 0:
+            raise ValueError(f"APPEARANCE_DIM must be > 0, got {appearance_dim}.")
+        if hidden_dim <= 0:
+            raise ValueError(f"APPEARANCE_HIDDEN_DIM must be > 0, got {hidden_dim}.")
+        if appearance_lr <= 0:
+            raise ValueError(f"LR_APPEARANCE must be > 0, got {appearance_lr}.")
+
 
 
 def train(config_path, device="cuda"):
@@ -35,6 +55,7 @@ def train(config_path, device="cuda"):
     meta_cfg = ConfigDict(config_path=config_path)
     print(meta_cfg)
     cfg = meta_cfg.MODEL
+    validate_model_cfg(cfg)
 
     # build output directory
     output_dir = os.path.join("outputs", meta_cfg.EXP_STR, meta_cfg.TIME_STR)
@@ -49,7 +70,9 @@ def train(config_path, device="cuda"):
     num_train = len(train_dataset._records_keys)
 
     # build model
-    model = Simple3DGS(cfg, train_dataset._data_info).to(device)
+    data_info = dict(train_dataset._data_info)
+    data_info["num_train_images"] = train_dataset._data_info["num_images"]
+    model = Simple3DGS(cfg, data_info).to(device)
     print(f"Initialized {model.num_gaussians} Gaussians")
 
     # per-parameter optimizers (required by gsplat DefaultStrategy)
@@ -64,6 +87,14 @@ def train(config_path, device="cuda"):
     optimizers = {}
     for name, param in model.splats.items():
         optimizers[name] = torch.optim.Adam([param], lr=lr_map[name], eps=1e-15)
+    if model.use_appearance:
+        appearance_lr = getattr(cfg, "LR_APPEARANCE", cfg.LR_SH0)
+        optimizers["appearance_embeddings"] = torch.optim.Adam(
+            model.appearance_embeddings.parameters(), lr=appearance_lr, eps=1e-15
+        )
+        optimizers["exposure_mlp"] = torch.optim.Adam(
+            model.exposure_mlp.parameters(), lr=appearance_lr, eps=1e-15
+        )
 
     # exponential LR decay for means
     total_steps = cfg.TRAIN_TOTAL_STEP
@@ -96,17 +127,14 @@ def train(config_path, device="cuda"):
         # sample random training image
         data = train_dataset[random.randint(0, num_train - 1)]
 
-        # ====================== LOW-LIGHT ENHANCEMENT ======================
-        # > TODO:: change this simple implementation
-        
-        gt_image = gamma_augment(data["images"].to(device))  # (3, H, W)
-        # ===================================================================
+        gt_image = prepare_train_target(data["images"].to(device), cfg)  # (3, H, W)
 
         camtoworld = data["transforms"].to(device)  # (3, 4)
         H, W = gt_image.shape[1], gt_image.shape[2]
 
         # forward
-        rendered, alphas, info = model(camtoworld, H, W)
+        image_id = data["image_id"].to(device) if model.use_appearance else None
+        rendered, alphas, info = model(camtoworld, H, W, image_id=image_id, canonical=False)
 
         # loss: (1 - lambda) * L1 + lambda * (1 - SSIM)
         gt_hwc = gt_image.permute(1, 2, 0)  # (H, W, 3)
@@ -133,7 +161,7 @@ def train(config_path, device="cuda"):
                 psnr = -10.0 * math.log10(mse.clamp_min(1e-10).item())
             pbar.set_postfix(loss=f"{loss.item():.4f}", psnr=f"{psnr:.2f}", n_gs=model.num_gaussians)
 
-        # collect augmented train images for visualization (only once)
+        # collect first training targets for visualization (only once)
         if train_aug_images is not None:
             train_aug_images.append(gt_image.clamp(0, 1))
             if len(train_aug_images) >= 4:
@@ -144,11 +172,11 @@ def train(config_path, device="cuda"):
         # validation
         if step > 0 and step % cfg.VAL_INTERVAL_STEP == 0:
             validate(model, val_dataset, step, device, output_dir)
-            torch.save(model.splats.state_dict(), os.path.join(output_dir, "latest.pt"))
+            torch.save(model.state_dict(), os.path.join(output_dir, "latest.pt"))
             print(f"Model saved to {output_dir}/latest.pt")
 
     # save model checkpoint
-    torch.save(model.splats.state_dict(), os.path.join(output_dir, "latest.pt"))
+    torch.save(model.state_dict(), os.path.join(output_dir, "latest.pt"))
     print(f"Model saved to {output_dir}/latest.pt")
 
     # run test evaluation
@@ -165,7 +193,7 @@ def validate(model, val_dataset, step, device, output_dir):
     for i in range(num_val):
         data = val_dataset[i]
         camtoworld = data["transforms"].to(device)
-        rendered, _, _ = model(camtoworld, H, W)
+        rendered, _, _ = model(camtoworld, H, W, canonical=True)
         # collect first 4 rendered images for visual spot-checking
         if i < 4:
             val_images.append(rendered.permute(2, 0, 1).clamp(0, 1))
@@ -185,7 +213,7 @@ def evaluate(model, test_dataset, device, output_dir):
     for i in range(num_test):
         data = test_dataset[i]
         camtoworld = data["transforms"].to(device)
-        rendered, _, _ = model(camtoworld, H, W)
+        rendered, _, _ = model(camtoworld, H, W, canonical=True)
         frame_name = test_dataset._records_keys[i]
         save_image(
             rendered.permute(2, 0, 1).clamp(0, 1),

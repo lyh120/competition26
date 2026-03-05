@@ -20,6 +20,9 @@ class Simple3DGS(nn.Module):
         self.bg_color = data_info["bg_color"]
         self.sh_degree_max = model_cfg.SH_DEGREE
         self.sh_degree = 0  # will be increased during training
+        self.use_appearance = getattr(model_cfg, "USE_APPEARANCE", True)
+        self.appearance_dim = getattr(model_cfg, "APPEARANCE_DIM", 32)
+        self.appearance_hidden_dim = getattr(model_cfg, "APPEARANCE_HIDDEN_DIM", 128)
 
         num_points = model_cfg.NUM_INIT_POINTS
         num_sh_bases = (self.sh_degree_max + 1) ** 2
@@ -45,11 +48,40 @@ class Simple3DGS(nn.Module):
             }
         )
 
+        if self.use_appearance:
+            self.appearance_embeddings = nn.Embedding(data_info["num_train_images"], self.appearance_dim)
+            self.exposure_mlp = nn.Sequential(
+                nn.Linear(self.appearance_dim + 3, self.appearance_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.appearance_hidden_dim, self.appearance_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.appearance_hidden_dim, 6),
+            )
+        else:
+            self.appearance_embeddings = None
+            self.exposure_mlp = None
+
     @property
     def num_gaussians(self):
         return self.splats["means"].shape[0]
 
-    def forward(self, camtoworld, img_h, img_w):
+    def _apply_appearance(self, rendered, image_id=None, canonical=False):
+        if not self.use_appearance:
+            return rendered
+        if canonical or image_id is None:
+            return rendered
+
+        embedding = self.appearance_embeddings(image_id.view(1))
+        global_color = rendered.mean(dim=(0, 1), keepdim=False).view(1, 3)
+        exposure_input = torch.cat([embedding, global_color], dim=-1)
+        exposure_params = self.exposure_mlp(exposure_input)
+
+        color_scale = 0.8 + 0.4 * torch.sigmoid(exposure_params[:, 0:3])
+        color_bias = 0.05 * torch.tanh(exposure_params[:, 3:6])
+        rendered = color_scale.view(1, 1, 3) * rendered + color_bias.view(1, 1, 3)
+        return rendered
+
+    def forward(self, camtoworld, img_h, img_w, image_id=None, canonical=False):
         """
         Render an image from the given camera pose.
 
@@ -105,5 +137,5 @@ class Simple3DGS(nn.Module):
             packed=False,
         )
 
-        # renders: (1, H, W, 3), alphas: (1, H, W, 1)
-        return renders[0], alphas[0], info
+        rendered = self._apply_appearance(renders[0], image_id=image_id, canonical=canonical)
+        return rendered, alphas[0], info
