@@ -50,6 +50,47 @@ def calc_params(model):
     return op_para_num, all_para_num
 
 
+def lowlight_enhance(image, model_cfg):
+    """Apply deterministic low-light enhancement for exported renders.
+
+    Pipeline:
+    1) Brightness normalization toward a target mean.
+    2) Adaptive gamma estimated from current brightness.
+    3) Optional fixed gamma fallback when adaptive mode is disabled.
+    """
+    image = torch.clamp(image, 0, 1)
+
+    if not bool(getattr(model_cfg, "USE_ADAPTIVE_RENDER_ENHANCE", True)):
+        gamma = float(getattr(model_cfg, "RENDER_GAMMA", 1.0))
+        if abs(gamma - 1.0) < 1e-8:
+            return image
+        return image.pow(gamma)
+
+    eps = float(getattr(model_cfg, "RENDER_EPS", 1e-6))
+    target_mean = float(getattr(model_cfg, "RENDER_TARGET_MEAN", 0.5))
+    max_scale = float(getattr(model_cfg, "RENDER_MAX_SCALE", 4.0))
+    gamma_base = float(getattr(model_cfg, "RENDER_GAMMA_BASE", 0.7))
+    gamma_slope = float(getattr(model_cfg, "RENDER_GAMMA_SLOPE", 0.6))
+    gamma_min = float(getattr(model_cfg, "RENDER_GAMMA_MIN", 0.4))
+    gamma_max = float(getattr(model_cfg, "RENDER_GAMMA_MAX", 1.2))
+
+    brightness = image.mean()
+
+    scale = target_mean / (brightness + eps)
+    scale = torch.clamp(scale, max=max_scale)
+    image = image * scale
+
+    gamma = torch.clamp(
+        torch.tensor(gamma_base, device=image.device, dtype=image.dtype)
+        + torch.tensor(gamma_slope, device=image.device, dtype=image.dtype)
+        * (0.5 - brightness),
+        min=gamma_min,
+        max=gamma_max,
+    )
+    image = image.pow(gamma)
+    return torch.clamp(image, 0, 1)
+
+
 def pretty_dict(input_dict, indent=0):
     out_line = ""
     tab = "    "
