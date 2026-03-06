@@ -11,8 +11,9 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 
 from core.data import Blender
-from core.libs import ConfigDict
+from core.libs import ConfigDict, lowlight_enhance
 from core.model import Simple3DGS
+
 
 
 @torch.no_grad()
@@ -26,6 +27,26 @@ def evaluate(checkpoint_path, device="cuda"):
     config_dict["TIME_STR"] = ""
     meta_cfg = ConfigDict(config_path=config_dict)
     cfg = meta_cfg.MODEL
+    if bool(getattr(cfg, "USE_ADAPTIVE_RENDER_ENHANCE", True)):
+        render_eps = float(getattr(cfg, "RENDER_EPS", 1e-6))
+        target_mean = float(getattr(cfg, "RENDER_TARGET_MEAN", 0.5))
+        max_scale = float(getattr(cfg, "RENDER_MAX_SCALE", 4.0))
+        gamma_min = float(getattr(cfg, "RENDER_GAMMA_MIN", 0.4))
+        gamma_max = float(getattr(cfg, "RENDER_GAMMA_MAX", 1.2))
+        if render_eps <= 0:
+            raise ValueError(f"RENDER_EPS must be > 0, got {render_eps}.")
+        if target_mean <= 0 or target_mean > 1:
+            raise ValueError(f"RENDER_TARGET_MEAN must be in (0, 1], got {target_mean}.")
+        if max_scale <= 0:
+            raise ValueError(f"RENDER_MAX_SCALE must be > 0, got {max_scale}.")
+        if gamma_min <= 0 or gamma_max <= 0:
+            raise ValueError("RENDER_GAMMA_MIN and RENDER_GAMMA_MAX must be > 0.")
+        if gamma_min > gamma_max:
+            raise ValueError("RENDER_GAMMA_MIN must be <= RENDER_GAMMA_MAX.")
+    else:
+        render_gamma = float(getattr(cfg, "RENDER_GAMMA", 1.0))
+        if render_gamma <= 0:
+            raise ValueError(f"RENDER_GAMMA must be > 0, got {render_gamma}.")
 
     # load dataset (json only, no images)
     test_dataset = Blender(meta_cfg.DATASET, split="test", load_images=False)
@@ -51,6 +72,7 @@ def evaluate(checkpoint_path, device="cuda"):
         data = test_dataset[i]
         camtoworld = data["transforms"].to(device)
         rendered, _, _ = model(camtoworld, H, W, canonical=True)
+        rendered = lowlight_enhance(rendered, cfg)
         frame_name = test_dataset._records_keys[i]
         save_image(
             rendered.permute(2, 0, 1).clamp(0, 1),
