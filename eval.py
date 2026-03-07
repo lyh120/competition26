@@ -11,12 +11,13 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 
 from core.data import Blender
-from core.libs import ConfigDict
+from core.libs import ConfigDict, lowlight_enhance
 from core.model import Simple3DGS
 
 
+
 @torch.no_grad()
-def evaluate(checkpoint_path, device="cuda"):
+def evaluate(checkpoint_path, device="cuda", canonical=True, appearance_image_id=0):
     # load config from checkpoint directory
     ckpt_dir = os.path.dirname(checkpoint_path)
     config_path = os.path.join(ckpt_dir, "config.yaml")
@@ -26,6 +27,26 @@ def evaluate(checkpoint_path, device="cuda"):
     config_dict["TIME_STR"] = ""
     meta_cfg = ConfigDict(config_path=config_dict)
     cfg = meta_cfg.MODEL
+    if bool(getattr(cfg, "USE_ADAPTIVE_RENDER_ENHANCE", True)):
+        render_eps = float(getattr(cfg, "RENDER_EPS", 1e-6))
+        target_mean = float(getattr(cfg, "RENDER_TARGET_MEAN", 0.5))
+        max_scale = float(getattr(cfg, "RENDER_MAX_SCALE", 4.0))
+        gamma_min = float(getattr(cfg, "RENDER_GAMMA_MIN", 0.4))
+        gamma_max = float(getattr(cfg, "RENDER_GAMMA_MAX", 1.2))
+        if render_eps <= 0:
+            raise ValueError(f"RENDER_EPS must be > 0, got {render_eps}.")
+        if target_mean <= 0 or target_mean > 1:
+            raise ValueError(f"RENDER_TARGET_MEAN must be in (0, 1], got {target_mean}.")
+        if max_scale <= 0:
+            raise ValueError(f"RENDER_MAX_SCALE must be > 0, got {max_scale}.")
+        if gamma_min <= 0 or gamma_max <= 0:
+            raise ValueError("RENDER_GAMMA_MIN and RENDER_GAMMA_MAX must be > 0.")
+        if gamma_min > gamma_max:
+            raise ValueError("RENDER_GAMMA_MIN must be <= RENDER_GAMMA_MAX.")
+    else:
+        render_gamma = float(getattr(cfg, "RENDER_GAMMA", 1.0))
+        if render_gamma <= 0:
+            raise ValueError(f"RENDER_GAMMA must be > 0, got {render_gamma}.")
 
     # load dataset (json only, no images)
     test_dataset = Blender(meta_cfg.DATASET, split="test", load_images=False)
@@ -47,16 +68,35 @@ def evaluate(checkpoint_path, device="cuda"):
     output_dir = os.path.join(ckpt_dir, "test")
     os.makedirs(output_dir, exist_ok=True)
     num_test = len(test_dataset._records_keys)
+    use_appearance = (not canonical) and model.use_appearance
+    if use_appearance:
+        max_train_images = model.appearance_embeddings.num_embeddings
+        if appearance_image_id < 0 or appearance_image_id >= max_train_images:
+            raise ValueError(
+                f"appearance_image_id must be in [0, {max_train_images - 1}], got {appearance_image_id}."
+            )
+        eval_image_id = torch.tensor(appearance_image_id, dtype=torch.long, device=device)
+    else:
+        eval_image_id = None
+
     for i in tqdm(range(num_test), desc="Rendering"):
         data = test_dataset[i]
         camtoworld = data["transforms"].to(device)
-        rendered, _, _ = model(camtoworld, H, W, canonical=True)
+        rendered, _, _ = model(
+            camtoworld,
+            H,
+            W,
+            image_id=eval_image_id,
+            canonical=canonical,
+        )
+        rendered = lowlight_enhance(rendered, cfg)
         frame_name = test_dataset._records_keys[i]
         save_image(
             rendered.permute(2, 0, 1).clamp(0, 1),
             os.path.join(output_dir, f"{frame_name}.png"),
         )
-    print(f"Rendered {num_test} images to {output_dir}/ | {model.num_gaussians} Gaussians")
+    mode = "canonical" if canonical else f"appearance(image_id={appearance_image_id})"
+    print(f"Rendered {num_test} images to {output_dir}/ | {model.num_gaussians} Gaussians | mode={mode}")
 
 
 if __name__ == "__main__":
@@ -64,5 +104,22 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore", message=".*clean_up_tokenization_spaces.*")
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", "-w", required=True, type=str)
+    parser.add_argument(
+        "--canonical",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: disable appearance MLP (default), 0: enable appearance MLP with --appearance_image_id.",
+    )
+    parser.add_argument(
+        "--appearance_image_id",
+        type=int,
+        default=0,
+        help="Train image embedding index used when --canonical=0.",
+    )
     args = parser.parse_args()
-    evaluate(args.checkpoint)
+    evaluate(
+        args.checkpoint,
+        canonical=bool(args.canonical),
+        appearance_image_id=args.appearance_image_id,
+    )

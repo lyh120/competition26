@@ -14,7 +14,7 @@ from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
 from core.data import Blender
-from core.libs import ConfigDict, ssim
+from core.libs import ConfigDict, lowlight_enhance, ssim
 from core.model import Simple3DGS
 
 
@@ -31,11 +31,45 @@ def prepare_train_target(image, model_cfg):
     return image.pow(gamma)
 
 
+def image_gradient_l1(pred_hwc, gt_hwc):
+    """Edge-aware L1 loss on horizontal/vertical image gradients."""
+    pred_dx = pred_hwc[:, 1:, :] - pred_hwc[:, :-1, :]
+    gt_dx = gt_hwc[:, 1:, :] - gt_hwc[:, :-1, :]
+    pred_dy = pred_hwc[1:, :, :] - pred_hwc[:-1, :, :]
+    gt_dy = gt_hwc[1:, :, :] - gt_hwc[:-1, :, :]
+    return torch.abs(pred_dx - gt_dx).mean() + torch.abs(pred_dy - gt_dy).mean()
+
+
 def validate_model_cfg(model_cfg):
     """Run lightweight config validation to fail fast on invalid settings."""
     train_gamma = float(getattr(model_cfg, "TRAIN_TARGET_GAMMA", 1.0))
     if train_gamma <= 0:
         raise ValueError(f"TRAIN_TARGET_GAMMA must be > 0, got {train_gamma}.")
+
+    lambda_edge = float(getattr(model_cfg, "LAMBDA_EDGE", 0.0))
+    if lambda_edge < 0:
+        raise ValueError(f"LAMBDA_EDGE must be >= 0, got {lambda_edge}.")
+
+    if bool(getattr(model_cfg, "USE_ADAPTIVE_RENDER_ENHANCE", True)):
+        render_eps = float(getattr(model_cfg, "RENDER_EPS", 1e-6))
+        target_mean = float(getattr(model_cfg, "RENDER_TARGET_MEAN", 0.5))
+        max_scale = float(getattr(model_cfg, "RENDER_MAX_SCALE", 4.0))
+        gamma_min = float(getattr(model_cfg, "RENDER_GAMMA_MIN", 0.4))
+        gamma_max = float(getattr(model_cfg, "RENDER_GAMMA_MAX", 1.2))
+        if render_eps <= 0:
+            raise ValueError(f"RENDER_EPS must be > 0, got {render_eps}.")
+        if target_mean <= 0 or target_mean > 1:
+            raise ValueError(f"RENDER_TARGET_MEAN must be in (0, 1], got {target_mean}.")
+        if max_scale <= 0:
+            raise ValueError(f"RENDER_MAX_SCALE must be > 0, got {max_scale}.")
+        if gamma_min <= 0 or gamma_max <= 0:
+            raise ValueError("RENDER_GAMMA_MIN and RENDER_GAMMA_MAX must be > 0.")
+        if gamma_min > gamma_max:
+            raise ValueError("RENDER_GAMMA_MIN must be <= RENDER_GAMMA_MAX.")
+    else:
+        render_gamma = float(getattr(model_cfg, "RENDER_GAMMA", 1.0))
+        if render_gamma <= 0:
+            raise ValueError(f"RENDER_GAMMA must be > 0, got {render_gamma}.")
 
     if bool(getattr(model_cfg, "USE_APPEARANCE", True)):
         appearance_dim = int(getattr(model_cfg, "APPEARANCE_DIM", 32))
@@ -47,6 +81,39 @@ def validate_model_cfg(model_cfg):
             raise ValueError(f"APPEARANCE_HIDDEN_DIM must be > 0, got {hidden_dim}.")
         if appearance_lr <= 0:
             raise ValueError(f"LR_APPEARANCE must be > 0, got {appearance_lr}.")
+
+    total_steps = int(model_cfg.TRAIN_TOTAL_STEP)
+    densify_start = int(model_cfg.DENSIFY_START_STEP)
+    densify_stop = int(model_cfg.DENSIFY_STOP_STEP)
+    sh_upgrade_interval = int(model_cfg.SH_UPGRADE_INTERVAL)
+    sh_degree = int(model_cfg.SH_DEGREE)
+
+    if total_steps <= 0:
+        raise ValueError(f"TRAIN_TOTAL_STEP must be > 0, got {total_steps}.")
+    if densify_start < 0:
+        raise ValueError(f"DENSIFY_START_STEP must be >= 0, got {densify_start}.")
+    if densify_stop <= densify_start:
+        raise ValueError(
+            f"DENSIFY_STOP_STEP must be > DENSIFY_START_STEP, got {densify_stop} <= {densify_start}."
+        )
+    if densify_stop > total_steps:
+        raise ValueError(f"DENSIFY_STOP_STEP must be <= TRAIN_TOTAL_STEP, got {densify_stop} > {total_steps}.")
+
+    densify_ratio = densify_stop / float(total_steps)
+    if densify_ratio < 0.2:
+        warnings.warn(
+            "DENSIFY_STOP_STEP is less than 20% of TRAIN_TOTAL_STEP. "
+            "For long training, consider extending densification (e.g. 20%-35% of total steps).",
+            stacklevel=2,
+        )
+
+    if sh_upgrade_interval <= 0:
+        raise ValueError(f"SH_UPGRADE_INTERVAL must be > 0, got {sh_upgrade_interval}.")
+    if sh_degree > 0 and sh_upgrade_interval * sh_degree > total_steps:
+        warnings.warn(
+            "SH_UPGRADE_INTERVAL is large relative to TRAIN_TOTAL_STEP; SH may not reach the configured maximum degree.",
+            stacklevel=2,
+        )
 
 
 
@@ -136,11 +203,14 @@ def train(config_path, device="cuda"):
         image_id = data["image_id"].to(device) if model.use_appearance else None
         rendered, alphas, info = model(camtoworld, H, W, image_id=image_id, canonical=False)
 
-        # loss: (1 - lambda) * L1 + lambda * (1 - SSIM)
+        # loss: (1 - lambda) * L1 + lambda * (1 - SSIM) + edge regularization
         gt_hwc = gt_image.permute(1, 2, 0)  # (H, W, 3)
         l1_loss = torch.abs(rendered - gt_hwc).mean()
         ssim_val = ssim(rendered, gt_hwc)
-        loss = (1.0 - cfg.LAMBDA_SSIM) * l1_loss + cfg.LAMBDA_SSIM * (1.0 - ssim_val)
+        recon_loss = (1.0 - cfg.LAMBDA_SSIM) * l1_loss + cfg.LAMBDA_SSIM * (1.0 - ssim_val)
+        edge_lambda = float(getattr(cfg, "LAMBDA_EDGE", 0.0))
+        edge_loss = image_gradient_l1(rendered, gt_hwc) if edge_lambda > 0 else torch.tensor(0.0, device=device)
+        loss = recon_loss + edge_lambda * edge_loss
 
         # densification hooks
         strategy.step_pre_backward(model.splats, optimizers, strategy_state, step, info)
@@ -159,7 +229,12 @@ def train(config_path, device="cuda"):
             with torch.no_grad():
                 mse = ((rendered - gt_hwc) ** 2).mean()
                 psnr = -10.0 * math.log10(mse.clamp_min(1e-10).item())
-            pbar.set_postfix(loss=f"{loss.item():.4f}", psnr=f"{psnr:.2f}", n_gs=model.num_gaussians)
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                psnr=f"{psnr:.2f}",
+                edge=f"{edge_loss.item():.4f}",
+                n_gs=model.num_gaussians,
+            )
 
         # collect first training targets for visualization (only once)
         if train_aug_images is not None:
@@ -171,7 +246,7 @@ def train(config_path, device="cuda"):
 
         # validation
         if step > 0 and step % cfg.VAL_INTERVAL_STEP == 0:
-            validate(model, val_dataset, step, device, output_dir)
+            validate(model, val_dataset, step, device, output_dir, cfg)
             torch.save(model.state_dict(), os.path.join(output_dir, "latest.pt"))
             print(f"Model saved to {output_dir}/latest.pt")
 
@@ -181,11 +256,11 @@ def train(config_path, device="cuda"):
 
     # run test evaluation
     test_dataset = Blender(meta_cfg.DATASET, split="test", load_images=False)
-    evaluate(model, test_dataset, device, output_dir)
+    evaluate(model, test_dataset, device, output_dir, cfg)
 
 
 @torch.no_grad()
-def validate(model, val_dataset, step, device, output_dir):
+def validate(model, val_dataset, step, device, output_dir, model_cfg):
     model.eval()
     H, W = val_dataset._data_info["img_h"], val_dataset._data_info["img_w"]
     num_val = len(val_dataset._records_keys)
@@ -194,6 +269,7 @@ def validate(model, val_dataset, step, device, output_dir):
         data = val_dataset[i]
         camtoworld = data["transforms"].to(device)
         rendered, _, _ = model(camtoworld, H, W, canonical=True)
+        rendered = lowlight_enhance(rendered, model_cfg)
         # collect first 4 rendered images for visual spot-checking
         if i < 4:
             val_images.append(rendered.permute(2, 0, 1).clamp(0, 1))
@@ -206,7 +282,7 @@ def validate(model, val_dataset, step, device, output_dir):
 
 
 @torch.no_grad()
-def evaluate(model, test_dataset, device, output_dir):
+def evaluate(model, test_dataset, device, output_dir, model_cfg):
     model.eval()
     H, W = test_dataset._data_info["img_h"], test_dataset._data_info["img_w"]
     num_test = len(test_dataset._records_keys)
@@ -214,6 +290,7 @@ def evaluate(model, test_dataset, device, output_dir):
         data = test_dataset[i]
         camtoworld = data["transforms"].to(device)
         rendered, _, _ = model(camtoworld, H, W, canonical=True)
+        rendered = lowlight_enhance(rendered, model_cfg)
         frame_name = test_dataset._records_keys[i]
         save_image(
             rendered.permute(2, 0, 1).clamp(0, 1),
