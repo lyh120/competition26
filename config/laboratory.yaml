@@ -27,6 +27,12 @@ MODEL:
   APPEARANCE_DIM: 32
   APPEARANCE_HIDDEN_DIM: 128
   LR_APPEARANCE: 2.5e-3
+  # Degradation MLP (two-stage training)
+  USE_DEGRADATION_MLP: True
+  LR_DEGRADATION_MLP: 0.0001
+  SWITCH_STEP: 45000
+  # Dataset
+  ENHANCED_DATA_PATH: 'core/data/lowlight_development/development/Laboratory'
   TRAIN_TARGET_GAMMA: 1.0
   USE_ADAPTIVE_RENDER_ENHANCE: True
   RENDER_TARGET_MEAN: 0.5

@@ -17,7 +17,7 @@ from core.model import Simple3DGS
 
 
 @torch.no_grad()
-def evaluate(checkpoint_path, device="cuda"):
+def evaluate(checkpoint_path, device="cuda", disable_degradation=False):
     # load config from checkpoint directory
     ckpt_dir = os.path.dirname(checkpoint_path)
     config_path = os.path.join(ckpt_dir, "config.yaml")
@@ -71,8 +71,8 @@ def evaluate(checkpoint_path, device="cuda"):
     for i in tqdm(range(num_test), desc="Rendering"):
         data = test_dataset[i]
         camtoworld = data["transforms"].to(device)
-        rendered, _, _ = model(camtoworld, H, W, canonical=True)
-        rendered = lowlight_enhance(rendered, cfg)
+        rendered, _, _ = model(camtoworld, H, W, canonical=True, use_degradation=not disable_degradation)
+        # rendered = lowlight_enhance(rendered, cfg)
         frame_name = test_dataset._records_keys[i]
         save_image(
             rendered.permute(2, 0, 1).clamp(0, 1),
@@ -86,5 +86,7 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore", message=".*clean_up_tokenization_spaces.*")
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", "-w", required=True, type=str)
+    parser.add_argument("--disable_degradation", action="store_true", 
+                        help="Disable degradation MLP to output bright clean rendering")
     args = parser.parse_args()
-    evaluate(args.checkpoint)
+    evaluate(args.checkpoint, disable_degradation=args.disable_degradation)

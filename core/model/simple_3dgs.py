@@ -61,6 +61,18 @@ class Simple3DGS(nn.Module):
             self.appearance_embeddings = None
             self.exposure_mlp = None
 
+        self.use_degradation = getattr(model_cfg, "USE_DEGRADATION_MLP", True)
+        if self.use_degradation:
+            self.degradation_mlp = nn.Sequential(
+                nn.Linear(3, self.appearance_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.appearance_hidden_dim, self.appearance_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.appearance_hidden_dim, 6),
+            )
+        else:
+            self.degradation_mlp = None
+
     @property
     def num_gaussians(self):
         return self.splats["means"].shape[0]
@@ -81,7 +93,17 @@ class Simple3DGS(nn.Module):
         rendered = color_scale.view(1, 1, 3) * rendered + color_bias.view(1, 1, 3)
         return rendered
 
-    def forward(self, camtoworld, img_h, img_w, image_id=None, canonical=False):
+    def _apply_degradation(self, rendered):
+        if self.degradation_mlp is None:
+            return rendered
+        global_color = rendered.mean(dim=(0, 1), keepdim=False).view(1, 3)
+        D = self.degradation_mlp(global_color)
+        scale = torch.sigmoid(D[:, 0:3]) * 0.9 + 0.1
+        bias = torch.tanh(D[:, 3:6]) * 0.3
+        rendered = rendered * scale.view(1, 1, 3) + bias.view(1, 1, 3)
+        return rendered
+
+    def forward(self, camtoworld, img_h, img_w, image_id=None, canonical=False, use_degradation=True):
         """
         Render an image from the given camera pose.
 
@@ -89,6 +111,9 @@ class Simple3DGS(nn.Module):
             camtoworld: (3, 4) camera-to-world transformation matrix.
             img_h: image height in pixels.
             img_w: image width in pixels.
+            image_id: image index for appearance embedding.
+            canonical: if True, use canonical rendering (no appearance adjustment).
+            use_degradation: if True, apply degradation MLP (for Phase2 training).
         Returns:
             rendered: (H, W, 3) rendered RGB image.
             alphas: (H, W, 1) rendered alpha map.
@@ -138,4 +163,8 @@ class Simple3DGS(nn.Module):
         )
 
         rendered = self._apply_appearance(renders[0], image_id=image_id, canonical=canonical)
+
+        if use_degradation and self.degradation_mlp is not None:
+            rendered = self._apply_degradation(rendered)
+
         return rendered, alphas[0], info

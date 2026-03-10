@@ -120,13 +120,14 @@ def train(config_path, device="cuda"):
         yaml.dump(dict(meta_cfg), f, default_flow_style=False)
 
     # load dataset
-    train_dataset = Blender(meta_cfg.DATASET, split="train")
+    train_dataset_original = Blender(meta_cfg.DATASET, split="train")
+    train_dataset_enhanced = Blender(meta_cfg.DATASET, split="train", use_enhanced=True)
     val_dataset = Blender(meta_cfg.DATASET, split="val", load_images=False)
-    num_train = len(train_dataset._records_keys)
+    num_train = len(train_dataset_original._records_keys)
 
     # build model
-    data_info = dict(train_dataset._data_info)
-    data_info["num_train_images"] = train_dataset._data_info["num_images"]
+    data_info = dict(train_dataset_original._data_info)
+    data_info["num_train_images"] = train_dataset_original._data_info["num_images"]
     model = Simple3DGS(cfg, data_info).to(device)
     print(f"Initialized {model.num_gaussians} Gaussians")
 
@@ -171,6 +172,10 @@ def train(config_path, device="cuda"):
     )
     strategy_state = strategy.initialize_state(scene_scale=cfg.SCENE_SCALE)
 
+    # two-stage training config
+    switch_step = int(getattr(cfg, "SWITCH_STEP", total_steps // 2))
+    print(f"Two-stage training: Phase1 [0-{switch_step}] use enhanced, Phase2 [{switch_step}-{total_steps}] use original")
+
     # training loop
     train_aug_images = []
     pbar = tqdm(range(total_steps))
@@ -178,6 +183,22 @@ def train(config_path, device="cuda"):
         # gradually increase SH degree
         if step > 0 and step % cfg.SH_UPGRADE_INTERVAL == 0:
             model.sh_degree = min(model.sh_degree + 1, model.sh_degree_max)
+
+        # two-stage training: Phase1 uses enhanced images, Phase2 uses original low-light images
+        if step < switch_step:
+            train_dataset = train_dataset_enhanced
+            use_degradation = False
+        else:
+            train_dataset = train_dataset_original
+            use_degradation = True
+
+        # add degradation_mlp optimizer when entering Phase2
+        if step == switch_step and model.use_degradation:
+            degradation_lr = getattr(cfg, "LR_DEGRADATION_MLP", 1e-4)
+            optimizers["degradation_mlp"] = torch.optim.Adam(
+                model.degradation_mlp.parameters(), lr=degradation_lr, eps=1e-15
+            )
+            print(f"Phase2 started at step {switch_step}, added degradation_mlp to optimizer")
 
         # sample random training image
         data = train_dataset[random.randint(0, num_train - 1)]
@@ -189,7 +210,7 @@ def train(config_path, device="cuda"):
 
         # forward
         image_id = data["image_id"].to(device) if model.use_appearance else None
-        rendered, alphas, info = model(camtoworld, H, W, image_id=image_id, canonical=False)
+        rendered, alphas, info = model(camtoworld, H, W, image_id=image_id, canonical=False, use_degradation=use_degradation)
 
         # loss: (1 - lambda) * L1 + lambda * (1 - SSIM)
         gt_hwc = gt_image.permute(1, 2, 0)  # (H, W, 3)
@@ -248,8 +269,8 @@ def validate(model, val_dataset, step, device, output_dir, model_cfg):
     for i in range(num_val):
         data = val_dataset[i]
         camtoworld = data["transforms"].to(device)
-        rendered, _, _ = model(camtoworld, H, W, canonical=True)
-        rendered = lowlight_enhance(rendered, model_cfg)
+        rendered, _, _ = model(camtoworld, H, W, canonical=True, use_degradation=True)
+        # rendered = lowlight_enhance(rendered, model_cfg)
         # collect first 4 rendered images for visual spot-checking
         if i < 4:
             val_images.append(rendered.permute(2, 0, 1).clamp(0, 1))
@@ -269,8 +290,8 @@ def evaluate(model, test_dataset, device, output_dir, model_cfg):
     for i in range(num_test):
         data = test_dataset[i]
         camtoworld = data["transforms"].to(device)
-        rendered, _, _ = model(camtoworld, H, W, canonical=True)
-        rendered = lowlight_enhance(rendered, model_cfg)
+        rendered, _, _ = model(camtoworld, H, W, canonical=True, use_degradation=True)
+        # rendered = lowlight_enhance(rendered, model_cfg)
         frame_name = test_dataset._records_keys[i]
         save_image(
             rendered.permute(2, 0, 1).clamp(0, 1),

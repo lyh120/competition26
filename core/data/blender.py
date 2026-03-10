@@ -7,7 +7,7 @@ import torchvision
 
 
 class Blender(torch.utils.data.Dataset):
-    def __init__(self, data_cfg, split, load_images=True):
+    def __init__(self, data_cfg, split, load_images=True, use_enhanced=False):
         super().__init__()
         # build path
         assert split in ["train", "val", "test"]
@@ -15,7 +15,10 @@ class Blender(torch.utils.data.Dataset):
         self._load_images = load_images
         # load data
         self._split = split
-        self._img_path_base = os.path.join(data_cfg.DATA_PATH, split)
+        if use_enhanced and hasattr(data_cfg, 'ENHANCED_DATA_PATH'):
+            self._img_path_base = os.path.join(data_cfg.ENHANCED_DATA_PATH, split)
+        else:
+            self._img_path_base = os.path.join(data_cfg.DATA_PATH, split)
         if split == "val":
             self._split = "test"
             self._meta_path_base = os.path.join(data_cfg.DATA_PATH, "transforms_test.json")
